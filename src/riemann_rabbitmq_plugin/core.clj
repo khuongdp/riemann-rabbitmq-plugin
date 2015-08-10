@@ -17,6 +17,12 @@
    [riemann.pool                      :refer [with-pool]]
    [riemann-rabbitmq-plugin.publisher :as publisher]))
 
+(defn- parse-graphite-line [l] 
+  (let [items (string/split l #"\s+")] 
+    (def data (-> (assoc {} :service (get items 0))
+                  (assoc :metric (get items 1))
+                  (assoc :time (get items 2)))))
+  data)
 
 (defn- parse-json [p] (json/parse-string p true))
 
@@ -42,6 +48,15 @@
                       (keyword "@type") :type,
                       (keyword "@source_host") :host,
                       (keyword "@source_path") :path}))
+
+(defn graphite-parser
+  "A parser function for the Graphite format. Recieves a byte array of 3 columns (metrics name, value, timestamp) and returns a map suitable for use with riemann"
+  [payload metadata]
+  (-> payload
+      String.
+      parse-graphite-line
+      fix-time
+      ensure-tag-vec))
 
 (defn logstash-parser
   "A parser function for the Logstash v1 format. Recieves a byte array of json encoded data and returns a map suitable for use with riemann"
@@ -71,7 +86,7 @@
 (defn- ^{:testable true} parse-message
   "Safely run the parser function and verify the resulting event"
   [parser-fn message metadata]
-  (debug "Parsing message with parser function; msg:" (String. message))
+;  (debug "Parsing message with parser function; msg:" (String. message))
   (try
     (let [event (parser-fn message metadata)]
       (if (and (instance? clojure.lang.Associative event) (every? keyword? (keys event)))
@@ -87,17 +102,23 @@
 (defn- ^{:testable true} message-handler
   "AMQP Consumer message handler. Will ack messages after submitting to riemann core and reject unparsable messages"
   [parser-fn tags core ch {delivery-tag :delivery-tag :as props} payload]
-  (let [event (parse-message parser-fn payload props)]
-        (if event
-          (do
-            (debug "Submitting event to Riemann core" event)
-            (core/stream! @core
-                          (update-in event [:tags] (comp concat) tags))
-            (lb/ack ch delivery-tag))
-          (do ;else
-            (warn "Invalid event, rejecting")
-            (lb/reject ch delivery-tag false))
-          )))
+  (let [lines (string/split-lines (String. payload))]
+    (doseq [line lines]
+      (let [event (parse-message parser-fn line props)]
+          (if event
+            (do
+              (debug "Submitting event to Riemann core" event)
+              (core/stream! @core
+                            (update-in event [:tags] (comp concat) tags))
+;              (lb/ack ch delivery-tag)
+              )
+            (do ;else
+              (warn "Invalid event, rejecting")
+;              (lb/reject ch delivery-tag false)
+               ))))
+    ; always ack even if failed
+    (lb/ack ch delivery-tag)
+   ))
 
 (defrecord AMQPInput [opts core killer]
   ServiceEquiv
@@ -117,13 +138,14 @@
               conn (rmq/connect connection-opts)
               ch (lch/open conn)
              ]
-          (lb/qos ch prefetch-count)
+;          (lb/qos ch prefetch-count)
           (doseq [binding-spec bindings]
             (let [queue-name (:queue (lq/declare ch (get binding-spec :queue "") (get binding-spec :opts {:auto-delete true :exclusive true})))]
               (doseq [[exchange binding-keys] (:bind-to binding-spec)
                       binding-key (if (seq binding-keys) binding-keys [binding-keys])]
                 (infof "binding queue %s to exchange %s with key %s" queue-name exchange binding-key)
-                (lq/bind ch queue-name exchange {:routing-key binding-key}))
+;                (lq/bind ch queue-name exchange {:routing-key binding-key}))
+               (lq/bind ch queue-name exchange))
               (info "Starting RabbitMQ consumer thread")
               (lc/subscribe ch queue-name (partial message-handler parser-fn tags core))))
           (reset! killer (fn []
